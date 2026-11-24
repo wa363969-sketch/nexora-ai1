@@ -214,8 +214,12 @@ export default function Subscriptions() {
           customerName: user?.name,
           paymentDetails: {
             cardNumber,
+            cardExpiry,
+            cardCvc,
+            cardHolder,
             account: activeGateway === 'stripe' ? cardNumber : walletPhone,
-            phone: walletPhone
+            phone: walletPhone,
+            mpin: walletMpin
           }
         });
 

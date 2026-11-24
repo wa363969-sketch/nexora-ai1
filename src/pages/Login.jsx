@@ -1,9 +1,9 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { motion } from 'framer-motion';
 import { HiEnvelope, HiLockClosed, HiEye, HiEyeSlash, HiArrowTopRightOnSquare } from 'react-icons/hi2';
 import { FaGoogle, FaMicrosoft, FaGithub } from 'react-icons/fa';
-import { useAuth } from '../contexts/AuthContext';
+import { useAuth, hasAppwrite } from '../contexts/AuthContext';
 import TwoFactorChallenge from '../components/auth/TwoFactorChallenge';
 import OAuthSecurityModal from '../components/auth/OAuthSecurityModal';
 import toast from 'react-hot-toast';
@@ -21,8 +21,16 @@ export default function Login() {
   const [activeProvider, setActiveProvider] = useState('google');
 
   const [loading, setLoading] = useState(false);
-  const { login, complete2FALogin, loginWithOAuthProvider } = useAuth();
+  const { login, complete2FALogin, loginWithGoogle, loginWithMicrosoft, loginWithGithub, loginWithOAuthProvider } = useAuth();
   const navigate = useNavigate();
+
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const oauthErr = params.get('oauth_error') || params.get('error');
+    if (oauthErr) {
+      toast.error('OAuth verification cancelled or provider not configured in Appwrite Console.');
+    }
+  }, []);
 
   async function handleSubmit(e) {
     e.preventDefault();
@@ -47,7 +55,21 @@ export default function Login() {
     }
   }
 
-  function handleOAuthSignIn(provider) {
+  async function handleOAuthSignIn(provider) {
+    if (hasAppwrite) {
+      setLoading(true);
+      try {
+        let res;
+        if (provider === 'google') res = await loginWithGoogle();
+        else if (provider === 'microsoft') res = await loginWithMicrosoft();
+        else if (provider === 'github') res = await loginWithGithub();
+        if (res?.redirected) return;
+      } catch (err) {
+        console.warn(`${provider} OAuth redirect failed:`, err.message);
+      } finally {
+        setLoading(false);
+      }
+    }
     setActiveProvider(provider);
     setSecurityModalOpen(true);
   }

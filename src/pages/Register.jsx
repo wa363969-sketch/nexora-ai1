@@ -3,7 +3,7 @@ import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 import { motion } from 'framer-motion';
 import { HiEnvelope, HiLockClosed, HiEye, HiEyeSlash, HiUser, HiSparkles } from 'react-icons/hi2';
 import { FaGoogle, FaMicrosoft, FaGithub } from 'react-icons/fa';
-import { useAuth } from '../contexts/AuthContext';
+import { useAuth, hasAppwrite } from '../contexts/AuthContext';
 import OAuthSecurityModal from '../components/auth/OAuthSecurityModal';
 import toast from 'react-hot-toast';
 
@@ -25,7 +25,7 @@ export default function Register() {
   const [activeProvider, setActiveProvider] = useState('google');
   
   const [loading, setLoading] = useState(false);
-  const { register, loginWithOAuthProvider } = useAuth();
+  const { register, loginWithGoogle, loginWithMicrosoft, loginWithGithub, loginWithOAuthProvider } = useAuth();
   const navigate = useNavigate();
 
   async function handleSubmit(e) {
@@ -63,7 +63,22 @@ export default function Register() {
     }
   }
 
-  function handleOpenSocial(provider) {
+  async function handleOpenSocial(provider) {
+    if (hasAppwrite) {
+      setLoading(true);
+      try {
+        const planMeta = { selectedPlan, selectedBilling };
+        let res;
+        if (provider === 'google') res = await loginWithGoogle(null, null, planMeta);
+        else if (provider === 'microsoft') res = await loginWithMicrosoft(null, null, planMeta);
+        else if (provider === 'github') res = await loginWithGithub(null, null, planMeta);
+        if (res?.redirected) return;
+      } catch (err) {
+        console.warn(`${provider} OAuth signup redirect failed:`, err.message);
+      } finally {
+        setLoading(false);
+      }
+    }
     setActiveProvider(provider);
     setSecurityModalOpen(true);
   }

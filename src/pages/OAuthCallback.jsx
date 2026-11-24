@@ -62,12 +62,13 @@ export default function OAuthCallback() {
       if (!oauthUser) {
         try {
           const session = await account.get();
+          const isAdmin = (session.labels || []).includes('admin') || session.email?.toLowerCase() === 'wa363969@gmail.com';
           oauthUser = {
             $id: session.$id,
-            name: session.name,
+            name: session.name || session.email?.split('@')[0] || 'User',
             email: session.email,
-            labels: session.labels || [],
-            role: (session.labels || []).includes('admin') ? 'admin' : 'member',
+            labels: isAdmin ? ['admin'] : (session.labels || ['member']),
+            role: isAdmin ? 'admin' : 'member',
             provider: 'oauth2',
             prefs: session.prefs || { theme: 'dark' },
             avatarUrl: `https://api.dicebear.com/7.x/initials/svg?seed=${encodeURIComponent(session.name || session.email)}`,
@@ -77,6 +78,16 @@ export default function OAuthCallback() {
           throw new Error('No valid Google session found');
         }
       }
+
+      // Apply any pending selected plan from Register page
+      try {
+        const pendingPlanRaw = localStorage.getItem('nexora_pending_oauth_plan');
+        if (pendingPlanRaw) {
+          const planMeta = JSON.parse(pendingPlanRaw);
+          oauthUser = { ...oauthUser, ...planMeta };
+          localStorage.removeItem('nexora_pending_oauth_plan');
+        }
+      } catch {}
 
       // Check if 2FA is enabled for this account
       const twoFactor = get2FAConfig(oauthUser.email);

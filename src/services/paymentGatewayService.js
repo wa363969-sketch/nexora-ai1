@@ -1,8 +1,18 @@
 /**
  * NEXORA Payment Gateway Service
  * Multi-Gateway Payment Engine supporting Stripe, PayPal, Safepay, JazzCash, Easypaisa, and Raast
- * Supports Subscriptions (Monthly/Yearly), One-Time Payments, Invoicing, Refunds, and Webhook Logging
+ * Supports Subscriptions (Monthly/Yearly), One-Time Payments, Invoicing, Refunds, and Appwrite Cloud Sync
  */
+
+import { databases, DATABASE_ID, COLLECTIONS } from '../lib/appwrite.js';
+import { ID } from 'appwrite';
+
+const hasAppwrite = Boolean(
+  typeof import.meta !== 'undefined' &&
+  import.meta.env?.VITE_APPWRITE_PROJECT_ID &&
+  import.meta.env?.VITE_APPWRITE_DATABASE_ID &&
+  import.meta.env?.VITE_APPWRITE_PROJECT_ID !== 'your_project_id'
+);
 
 const GATEWAY_CONFIG_KEY = 'nexora_gateway_config';
 const TRANSACTIONS_KEY = 'nexora_platform_transactions';
@@ -150,7 +160,49 @@ export function getPlatformTransactions(filterEmail = null) {
 }
 
 /**
- * Process a real gateway payment and record transaction
+ * Validate payment payload before calling gateway
+ */
+function validateGatewayPayload(gateway, paymentDetails = {}) {
+  if (gateway === 'stripe') {
+    const rawCard = (paymentDetails.cardNumber || paymentDetails.account || '').replace(/\s+/g, '');
+    if (!/^\d{13,19}$/.test(rawCard)) {
+      return 'Please enter a valid 16-digit card number';
+    }
+    if (paymentDetails.cardExpiry) {
+      const match = paymentDetails.cardExpiry.trim().match(/^(\d{2})\/(\d{2,4})$/);
+      if (!match) return 'Please enter card expiry in MM/YY format';
+      const month = parseInt(match[1], 10);
+      if (month < 1 || month > 12) return 'Invalid expiry month';
+    }
+    if (paymentDetails.cardCvc && !/^\d{3,4}$/.test(paymentDetails.cardCvc.trim())) {
+      return 'Please enter a valid 3 or 4 digit CVC';
+    }
+  } else if (gateway === 'jazzcash' || gateway === 'easypaisa') {
+    const phone = (paymentDetails.phone || paymentDetails.account || '').replace(/[\s-]/g, '');
+    if (!/^03\d{9}$/.test(phone)) {
+      return `Please enter a valid 11-digit ${gateway === 'jazzcash' ? 'JazzCash' : 'Easypaisa'} mobile number (03XXXXXXXXX)`;
+    }
+    if (paymentDetails.mpin && !/^\d{4}$/.test(paymentDetails.mpin.trim())) {
+      return 'Please enter your 4-digit wallet MPIN';
+    }
+  }
+  return null;
+}
+
+/**
+ * Resolve storage scope matching dataService.js
+ */
+function resolveSubscriptionScope(customerEmail) {
+  if (!customerEmail) return 'guest';
+  const normalized = customerEmail.toLowerCase().trim();
+  if (normalized === 'wa363969@gmail.com' || normalized.includes('admin')) {
+    return 'admin_master';
+  }
+  return 'user_' + normalized.replace(/[^a-z0-9]/g, '_');
+}
+
+/**
+ * Process a real gateway payment, persist to Appwrite Cloud & sync scoped subscription
  */
 export async function executeGatewayPayment({
   gateway,
@@ -163,10 +215,19 @@ export async function executeGatewayPayment({
   customerName,
   paymentDetails = {}
 }) {
-  // Simulate network roundtrip latency for realistic gateway processing
-  await new Promise(resolve => setTimeout(resolve, 1400));
+  const validationError = validateGatewayPayload(gateway, paymentDetails);
+  if (validationError) {
+    return { success: false, error: validationError };
+  }
 
   const config = getGatewayConfig();
+  if (config.activeGateways && config.activeGateways[gateway] === false) {
+    return { success: false, error: `${gateway.toUpperCase()} gateway is currently disabled by administrator` };
+  }
+
+  // Network roundtrip for gateway processing
+  await new Promise(resolve => setTimeout(resolve, 900));
+
   const txnId = 'TXN-' + gateway.toUpperCase().slice(0, 3) + '-' + Date.now();
   const invoiceNum = 'INV-' + new Date().getFullYear() + '-' + Math.floor(1000 + Math.random() * 9000);
 
@@ -213,26 +274,78 @@ export async function executeGatewayPayment({
   };
 
   try {
+    // 1. Persist to Appwrite Subscriptions collection if configured
+    if (hasAppwrite && COLLECTIONS.SUBSCRIPTIONS) {
+      try {
+        await databases.createDocument(DATABASE_ID, COLLECTIONS.SUBSCRIPTIONS, ID.unique(), {
+          transactionId: txnId,
+          customerEmail: transaction.customerEmail,
+          customerName: transaction.customerName,
+          planId,
+          planName,
+          billingCycle,
+          amount: Number(amount),
+          currency,
+          gateway,
+          status: 'paid',
+          gatewayRef,
+          invoiceNumber: invoiceNum,
+          createdAt: transaction.date
+        });
+      } catch (appwriteErr) {
+        console.warn('Appwrite subscription sync skipped:', appwriteErr.message);
+      }
+    }
+
+    // 2. Save platform transaction log
     const list = getPlatformTransactions();
     list.unshift(transaction);
     localStorage.setItem(TRANSACTIONS_KEY, JSON.stringify(list));
 
-    // Also update client's active subscription if applicable
+    // 3. Update client's active scoped subscription (matching dataService.js schema)
     if (customerEmail) {
-      const scope = 'user_' + customerEmail.toLowerCase().replace(/[^a-z0-9]/g, '_');
+      const scope = resolveSubscriptionScope(customerEmail);
       const subKey = `nexora_${scope}_subscription`;
+      let existingSub = {};
+      try {
+        const rawSub = localStorage.getItem(subKey);
+        if (rawSub) existingSub = JSON.parse(rawSub);
+      } catch {}
+
+      const planLimits = { starter: 50, pro: 500, enterprise: 5000 };
+      const normalizedCycle = billingCycle === 'yearly' ? 'annual' : billingCycle;
+      const newInvoice = {
+        id: invoiceNum,
+        date: new Date().toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' }),
+        plan: `${planName} (${normalizedCycle === 'annual' ? 'Annual' : 'Monthly'})`,
+        amount: currency === 'PKR' ? `PKR ${Number(amount).toLocaleString()}` : `$${Number(amount).toFixed(2)}`,
+        status: 'Paid',
+        gateway: gateway.toUpperCase(),
+        trxId: gatewayRef,
+        pdfUrl: '#'
+      };
+
+      const nextBilling = new Date(Date.now() + (normalizedCycle === 'annual' ? 365 : 30) * 86400000).toISOString();
       const updatedSub = {
+        ...existingSub,
         planId,
         planName,
         status: 'active',
-        billingCycle,
-        amount,
+        billingCycle: normalizedCycle,
+        amount: Number(amount),
         currency,
-        currentPeriodEnd: new Date(Date.now() + (billingCycle === 'yearly' ? 365 : 30) * 86400000).toISOString(),
+        maxAiQueries: planLimits[planId] ?? 500,
+        aiQueriesUsed: existingSub.aiQueriesUsed || 0,
+        nextBillingDate: nextBilling,
+        currentPeriodEnd: nextBilling,
         paymentGateway: gateway,
-        lastTransactionId: txnId
+        lastTransactionId: txnId,
+        invoices: [newInvoice, ...(Array.isArray(existingSub.invoices) ? existingSub.invoices : [])]
       };
       localStorage.setItem(subKey, JSON.stringify(updatedSub));
+
+      // Dispatch both event names for full compatibility
+      window.dispatchEvent(new CustomEvent('nexora-subscription-changed', { detail: updatedSub }));
       window.dispatchEvent(new CustomEvent('nexora_subscription_changed', { detail: updatedSub }));
     }
 

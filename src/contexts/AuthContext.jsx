@@ -1,12 +1,12 @@
 import { createContext, useContext, useState, useEffect } from 'react';
 import { account, avatars } from '../lib/appwrite';
-import { ID } from 'appwrite';
+import { ID, OAuthProvider } from 'appwrite';
 import { recordClientRegistry } from '../services/dataService';
 import { get2FAConfig } from '../services/twoFactorService';
 
 const AuthContext = createContext(null);
 
-const hasAppwrite = Boolean(
+export const hasAppwrite = Boolean(
   import.meta.env.VITE_APPWRITE_PROJECT_ID && 
   import.meta.env.VITE_APPWRITE_PROJECT_ID !== 'your_project_id'
 );
@@ -47,8 +47,14 @@ export function AuthProvider({ children }) {
     if (!hasAppwrite) return;
     try {
       const session = await account.get();
-      setUser(session);
-      localStorage.setItem('nexora_user_session', JSON.stringify(session));
+      const isAdmin = (session.labels || []).includes('admin') || session.email?.toLowerCase() === 'wa363969@gmail.com';
+      const normalized = {
+        ...session,
+        labels: isAdmin ? Array.from(new Set([...(session.labels || []), 'admin'])) : (session.labels || ['member']),
+        role: isAdmin ? 'admin' : 'member',
+      };
+      setUser(normalized);
+      localStorage.setItem('nexora_user_session', JSON.stringify(normalized));
     } catch {
       // Keep existing session or state
     }
@@ -157,17 +163,25 @@ export function AuthProvider({ children }) {
     return sessionUser;
   }
 
+  function persistPendingOAuthPlan(planMeta = {}) {
+    try {
+      if (planMeta && (planMeta.selectedPlan || planMeta.selectedBilling)) {
+        localStorage.setItem('nexora_pending_oauth_plan', JSON.stringify(planMeta));
+      }
+    } catch {}
+  }
+
   async function loginWithGoogle(email = null, name = null, planMeta = {}) {
     if (hasAppwrite) {
       // Real OAuth2 redirect to Google – user gets Google login page
       try {
-        await account.createOAuth2Session(
+        persistPendingOAuthPlan(planMeta);
+        account.createOAuth2Session(
           OAuthProvider.Google,
           `${window.location.origin}/auth/callback`,  // success → back to app
-          `${window.location.origin}/login`            // failure → back to login
+          `${window.location.origin}/login?oauth_error=google_failed` // failure → back to login
         );
-        // browser will redirect – nothing else runs here
-        return;
+        return { redirected: true };
       } catch (err) {
         console.warn('Google OAuth2 redirect failed:', err.message);
       }
@@ -179,12 +193,13 @@ export function AuthProvider({ children }) {
   async function loginWithMicrosoft(email = null, name = null, planMeta = {}) {
     if (hasAppwrite) {
       try {
-        await account.createOAuth2Session(
+        persistPendingOAuthPlan(planMeta);
+        account.createOAuth2Session(
           OAuthProvider.Microsoft,
           `${window.location.origin}/auth/callback`,
-          `${window.location.origin}/login`
+          `${window.location.origin}/login?oauth_error=microsoft_failed`
         );
-        return;
+        return { redirected: true };
       } catch (err) {
         console.warn('Microsoft OAuth2 redirect failed:', err.message);
       }
@@ -195,12 +210,13 @@ export function AuthProvider({ children }) {
   async function loginWithGithub(email = null, name = null, planMeta = {}) {
     if (hasAppwrite) {
       try {
-        await account.createOAuth2Session(
+        persistPendingOAuthPlan(planMeta);
+        account.createOAuth2Session(
           OAuthProvider.Github,
           `${window.location.origin}/auth/callback`,
-          `${window.location.origin}/login`
+          `${window.location.origin}/login?oauth_error=github_failed`
         );
-        return;
+        return { redirected: true };
       } catch (err) {
         console.warn('GitHub OAuth2 redirect failed:', err.message);
       }
