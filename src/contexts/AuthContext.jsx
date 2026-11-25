@@ -7,25 +7,131 @@ import { get2FAConfig } from '../services/twoFactorService';
 const AuthContext = createContext(null);
 
 export const hasAppwrite = Boolean(
-  import.meta.env.VITE_APPWRITE_PROJECT_ID && 
+  import.meta.env.VITE_APPWRITE_PROJECT_ID &&
   import.meta.env.VITE_APPWRITE_PROJECT_ID !== 'your_project_id'
 );
 
+const CREDENTIALS_STORE_KEY = 'nexora_auth_credentials';
+const RESET_TOKENS_KEY = 'nexora_password_reset_tokens';
+const ADMIN_EMAIL = 'wa363969@gmail.com';
+
+// Precomputed salted SHA-256 hashes for bootstrap admin verification when Appwrite is offline/paused
+const ADMIN_BOOTSTRAP_HASHES = [
+  '570823b4695f462d86480853f00385c204f7a1f60af415e402df2fc3fa104b4e',
+  'e1517358e8c1e110cce896dbfdaeb9a3ac04050ab22ab2d3c1059e4de3d4fc8f',
+  '62a89d29d9fb4621134fc82f6245d39a1d548db5cf5d5c66f6a467fa16e212da',
+  '7ddd2dfb1dc99e0035f1d70539399bb48700d2a07cdf0855a234e9ae55878636',
+];
+
+async function hashPassword(password, email) {
+  const input = `nexora_v1:${email.toLowerCase().trim()}:${password}`;
+  if (typeof crypto !== 'undefined' && crypto.subtle) {
+    const encoded = new TextEncoder().encode(input);
+    const digest = await crypto.subtle.digest('SHA-256', encoded);
+    return Array.from(new Uint8Array(digest))
+      .map(b => b.toString(16).padStart(2, '0'))
+      .join('');
+  }
+  // Deterministic fallback hash for non-secure contexts
+  let h1 = 0xdeadbeef;
+  let h2 = 0x41c6ce57;
+  for (let i = 0; i < input.length; i++) {
+    const ch = input.charCodeAt(i);
+    h1 = Math.imul(h1 ^ ch, 2654435761);
+    h2 = Math.imul(h2 ^ ch, 1597334677);
+  }
+  h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+  h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+  return (4294967296 * (2097151 & h2) + (h1 >>> 0)).toString(16);
+}
+
+function getLocalCredentials() {
+  try {
+    const raw = localStorage.getItem(CREDENTIALS_STORE_KEY);
+    return raw ? JSON.parse(raw) : {};
+  } catch {
+    return {};
+  }
+}
+
+function saveLocalCredentials(creds) {
+  try {
+    localStorage.setItem(CREDENTIALS_STORE_KEY, JSON.stringify(creds));
+  } catch {}
+}
+
+function isAppwriteServiceUnavailableError(err) {
+  if (!err) return true;
+  const code = err.code;
+  const type = err.type || '';
+  const msg = (err.message || '').toLowerCase();
+  return (
+    code === 403 ||
+    type === 'project_paused' ||
+    msg.includes('paused') ||
+    msg.includes('failed to fetch') ||
+    msg.includes('network')
+  );
+}
+
+async function isAppwriteActive() {
+  if (!hasAppwrite) return false;
+  try {
+    const endpoint = import.meta.env.VITE_APPWRITE_ENDPOINT || 'https://cloud.appwrite.io/v1';
+    const projectId = import.meta.env.VITE_APPWRITE_PROJECT_ID;
+    const res = await fetch(`${endpoint}/health/version`, {
+      headers: { 'X-Appwrite-Project': projectId },
+    });
+    if (!res.ok) return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function normalizeUserObject(rawUser, fallbackEmail) {
+  const email = (rawUser?.email || fallbackEmail || '').toLowerCase().trim();
+  const isAdmin = (rawUser?.labels || []).includes('admin') || email === ADMIN_EMAIL;
+  return {
+    ...rawUser,
+    $id: rawUser?.$id || 'user-' + Date.now(),
+    name: rawUser?.name || (email === ADMIN_EMAIL ? 'WA Admin' : email.split('@')[0].replace(/[._]/g, ' ').replace(/\b\w/g, c => c.toUpperCase())),
+    email,
+    labels: isAdmin ? Array.from(new Set([...(rawUser?.labels || []), 'admin'])) : (rawUser?.labels || ['member']),
+    role: isAdmin ? 'admin' : 'member',
+    prefs: rawUser?.prefs || { theme: 'dark' },
+  };
+}
+
+export async function verifyStoredPassword(email, password) {
+  const cleanEmail = (email || '').toLowerCase().trim();
+  if (!cleanEmail || !password) return false;
+
+  const creds = getLocalCredentials();
+  const pwHash = await hashPassword(password, cleanEmail);
+
+  if (creds[cleanEmail]?.passwordHash) {
+    return creds[cleanEmail].passwordHash === pwHash;
+  }
+
+  if (cleanEmail === ADMIN_EMAIL) {
+    return ADMIN_BOOTSTRAP_HASHES.includes(pwHash);
+  }
+
+  return false;
+}
+
 export function AuthProvider({ children }) {
   const [user, setUser] = useState(() => {
-    // Check local storage for persistent session
     const saved = localStorage.getItem('nexora_user_session');
     if (saved) {
-      try { return JSON.parse(saved); } catch (e) { /* ignore */ }
+      try {
+        return JSON.parse(saved);
+      } catch {
+        return null;
+      }
     }
-    return {
-      $id: 'user-admin-1',
-      name: 'WA Admin',
-      email: 'wa363969@gmail.com',
-      labels: ['admin'],
-      role: 'admin',
-      prefs: { theme: 'dark' },
-    };
+    return null;
   });
   const [loading, setLoading] = useState(false);
 
@@ -33,7 +139,6 @@ export function AuthProvider({ children }) {
     if (hasAppwrite) {
       checkAuth();
     }
-    // Listen for OAuth session ready event from OAuthCallback page
     const handleOAuthReady = (e) => {
       if (e.detail) {
         setUser(e.detail);
@@ -47,65 +152,118 @@ export function AuthProvider({ children }) {
     if (!hasAppwrite) return;
     try {
       const session = await account.get();
-      const isAdmin = (session.labels || []).includes('admin') || session.email?.toLowerCase() === 'wa363969@gmail.com';
-      const normalized = {
-        ...session,
-        labels: isAdmin ? Array.from(new Set([...(session.labels || []), 'admin'])) : (session.labels || ['member']),
-        role: isAdmin ? 'admin' : 'member',
-      };
+      const normalized = normalizeUserObject(session, session.email);
       setUser(normalized);
       localStorage.setItem('nexora_user_session', JSON.stringify(normalized));
     } catch {
-      // Keep existing session or state
+      // Keep existing local session if present
     }
   }
 
   async function login(email, password) {
+    const cleanEmail = (email || '').toLowerCase().trim();
+    if (!cleanEmail || !password) {
+      throw new Error('Please enter both your email and password.');
+    }
+    if (password.length < 6) {
+      throw new Error('Invalid email or password.');
+    }
+
     setLoading(true);
     try {
+      let authenticatedUser = null;
+      let shouldFallbackToLocal = !hasAppwrite;
+
       if (hasAppwrite) {
-        // Clear any stale session first to avoid "prohibited when session is active"
         try {
-          await account.deleteSession('current');
-        } catch (e) {
-          // No active session
+          try {
+            await account.deleteSession('current');
+          } catch {
+            // No active session to clear
+          }
+          await account.createEmailPasswordSession(cleanEmail, password);
+          const session = await account.get();
+          authenticatedUser = normalizeUserObject(session, cleanEmail);
+
+          // Sync verified password hash locally for offline continuity
+          const creds = getLocalCredentials();
+          const passwordHash = await hashPassword(password, cleanEmail);
+          creds[cleanEmail] = {
+            ...creds[cleanEmail],
+            $id: authenticatedUser.$id,
+            name: authenticatedUser.name,
+            email: cleanEmail,
+            role: authenticatedUser.role,
+            labels: authenticatedUser.labels,
+            passwordHash,
+            updatedAt: new Date().toISOString(),
+          };
+          saveLocalCredentials(creds);
+        } catch (err) {
+          if (isAppwriteServiceUnavailableError(err)) {
+            shouldFallbackToLocal = true;
+          } else {
+            // Check if the account exists in the local credential store (e.g. registered while Appwrite was paused)
+            const creds = getLocalCredentials();
+            if (creds[cleanEmail]) {
+              shouldFallbackToLocal = true;
+            } else {
+              throw new Error(err.message || 'Invalid email or password. Please try again.');
+            }
+          }
         }
-        await account.createEmailPasswordSession(email, password);
-        const session = await account.get();
-        setUser(session);
-        localStorage.setItem('nexora_user_session', JSON.stringify(session));
-        return session;
       }
-    } catch (e) {
-      console.warn('Appwrite login failed, attempting local authentication:', e.message);
+
+      if (shouldFallbackToLocal && !authenticatedUser) {
+        const creds = getLocalCredentials();
+        const existingRecord = creds[cleanEmail];
+        const pwHash = await hashPassword(password, cleanEmail);
+
+        if (existingRecord) {
+          if (existingRecord.passwordHash !== pwHash) {
+            throw new Error('Incorrect password. Please check your password and try again.');
+          }
+          authenticatedUser = normalizeUserObject(existingRecord, cleanEmail);
+        } else if (cleanEmail === ADMIN_EMAIL) {
+          if (!ADMIN_BOOTSTRAP_HASHES.includes(pwHash)) {
+            throw new Error('Incorrect password for this account.');
+          }
+          authenticatedUser = normalizeUserObject(
+            {
+              $id: 'user-admin-1',
+              name: 'WA Admin',
+              email: ADMIN_EMAIL,
+              labels: ['admin'],
+              role: 'admin',
+            },
+            ADMIN_EMAIL
+          );
+        } else {
+          throw new Error('No account found with this email address. Please sign up first.');
+        }
+      }
+
+      // Check Two-Factor Authentication for this verified user
+      const twoFactor = get2FAConfig(cleanEmail);
+      if (twoFactor && twoFactor.enabled) {
+        if (hasAppwrite) {
+          try {
+            await account.deleteSession('current');
+          } catch {}
+        }
+        return {
+          requires2FA: true,
+          pendingUser: { ...authenticatedUser, twoFactorConfig: twoFactor },
+        };
+      }
+
+      setUser(authenticatedUser);
+      localStorage.setItem('nexora_user_session', JSON.stringify(authenticatedUser));
+      recordClientRegistry(authenticatedUser);
+      return authenticatedUser;
     } finally {
       setLoading(false);
     }
-
-    const isAdmin = email.toLowerCase().includes('admin') || email.toLowerCase() === 'wa363969@gmail.com';
-    const role = isAdmin ? 'admin' : 'member';
-    const sessionUser = {
-      $id: 'user-' + Date.now(),
-      name: email === 'wa363969@gmail.com' ? 'WA Admin' : email.split('@')[0].replace(/[._]/g, ' ').replace(/\b\w/g, c => c.toUpperCase()),
-      email,
-      labels: role === 'admin' ? ['admin'] : [],
-      role,
-      prefs: { theme: 'dark' },
-    };
-
-    // Check if Two-Factor Authentication is enabled for this account
-    const twoFactor = get2FAConfig(email);
-    if (twoFactor && twoFactor.enabled) {
-      return {
-        requires2FA: true,
-        pendingUser: { ...sessionUser, twoFactorConfig: twoFactor }
-      };
-    }
-
-    setUser(sessionUser);
-    localStorage.setItem('nexora_user_session', JSON.stringify(sessionUser));
-    recordClientRegistry(sessionUser);
-    return sessionUser;
   }
 
   function complete2FALogin(authenticatedUser) {
@@ -116,51 +274,90 @@ export function AuthProvider({ children }) {
   }
 
   async function register(email, password, name, planMeta = {}) {
+    const cleanEmail = (email || '').toLowerCase().trim();
+    const cleanName = (name || '').trim();
+    if (!cleanName) throw new Error('Please enter your full name.');
+    if (!cleanEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) {
+      throw new Error('Please enter a valid email address.');
+    }
+    if (!password || password.length < 8) {
+      throw new Error('Password must be at least 8 characters long.');
+    }
+
     setLoading(true);
     const selectedPlan = planMeta?.selectedPlan || 'starter';
     const selectedBilling = planMeta?.selectedBilling || 'monthly';
-    try {
-      if (hasAppwrite) {
-        // Clear any previous session
-        try {
-          await account.deleteSession('current');
-        } catch (e) {
-          // No active session
-        }
 
-        // Create new account
-        await account.create(ID.unique(), email, password, name);
-        
-        // Immediately start session
-        await account.createEmailPasswordSession(email, password);
-        const session = await account.get();
-        session.selectedPlan = selectedPlan;
-        session.selectedBilling = selectedBilling;
-        setUser(session);
-        localStorage.setItem('nexora_user_session', JSON.stringify(session));
-        recordClientRegistry(session);
-        return session;
+    try {
+      let registeredUser = null;
+      let useLocalRegistration = !hasAppwrite;
+
+      if (hasAppwrite) {
+        try {
+          try {
+            await account.deleteSession('current');
+          } catch {}
+
+          await account.create(ID.unique(), cleanEmail, password, cleanName);
+          await account.createEmailPasswordSession(cleanEmail, password);
+          const session = await account.get();
+          registeredUser = normalizeUserObject(
+            { ...session, selectedPlan, selectedBilling },
+            cleanEmail
+          );
+        } catch (err) {
+          if (isAppwriteServiceUnavailableError(err)) {
+            useLocalRegistration = true;
+          } else if (err.code === 409) {
+            throw new Error('An account with this email already exists. Please sign in instead.');
+          } else {
+            throw new Error(err.message || 'Registration failed.');
+          }
+        }
       }
-    } catch (e) {
-      console.warn('Appwrite register failed, using persistent fallback:', e.message);
+
+      const creds = getLocalCredentials();
+      const passwordHash = await hashPassword(password, cleanEmail);
+
+      if (useLocalRegistration) {
+        if (creds[cleanEmail]) {
+          throw new Error('An account with this email already exists. Please sign in instead.');
+        }
+        registeredUser = normalizeUserObject(
+          {
+            $id: 'user-' + Date.now(),
+            name: cleanName,
+            email: cleanEmail,
+            selectedPlan,
+            selectedBilling,
+            createdAt: new Date().toISOString(),
+          },
+          cleanEmail
+        );
+      }
+
+      // Persist hashed password credential locally
+      creds[cleanEmail] = {
+        $id: registeredUser.$id,
+        name: registeredUser.name,
+        email: cleanEmail,
+        role: registeredUser.role,
+        labels: registeredUser.labels,
+        selectedPlan,
+        selectedBilling,
+        passwordHash,
+        createdAt: creds[cleanEmail]?.createdAt || new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      };
+      saveLocalCredentials(creds);
+
+      setUser(registeredUser);
+      localStorage.setItem('nexora_user_session', JSON.stringify(registeredUser));
+      recordClientRegistry(registeredUser);
+      return registeredUser;
     } finally {
       setLoading(false);
     }
-
-    const sessionUser = {
-      $id: 'user-' + Date.now(),
-      name: name || email.split('@')[0],
-      email,
-      labels: email.includes('admin') ? ['admin'] : [],
-      role: email.includes('admin') ? 'admin' : 'member',
-      selectedPlan,
-      selectedBilling,
-      prefs: { theme: 'dark' },
-    };
-    setUser(sessionUser);
-    localStorage.setItem('nexora_user_session', JSON.stringify(sessionUser));
-    recordClientRegistry(sessionUser);
-    return sessionUser;
   }
 
   function persistPendingOAuthPlan(planMeta = {}) {
@@ -172,26 +369,24 @@ export function AuthProvider({ children }) {
   }
 
   async function loginWithGoogle(email = null, name = null, planMeta = {}) {
-    if (hasAppwrite) {
-      // Real OAuth2 redirect to Google – user gets Google login page
+    if (await isAppwriteActive()) {
       try {
         persistPendingOAuthPlan(planMeta);
         account.createOAuth2Session(
           OAuthProvider.Google,
-          `${window.location.origin}/auth/callback`,  // success → back to app
-          `${window.location.origin}/login?oauth_error=google_failed` // failure → back to login
+          `${window.location.origin}/auth/callback`,
+          `${window.location.origin}/login?oauth_error=google_failed`
         );
         return { redirected: true };
       } catch (err) {
         console.warn('Google OAuth2 redirect failed:', err.message);
       }
     }
-    // Fallback for non-Appwrite environments
-    return loginWithOAuthProvider('google', email || 'user@gmail.com', name || 'Google User', planMeta);
+    return { redirected: false, paused: true };
   }
 
   async function loginWithMicrosoft(email = null, name = null, planMeta = {}) {
-    if (hasAppwrite) {
+    if (await isAppwriteActive()) {
       try {
         persistPendingOAuthPlan(planMeta);
         account.createOAuth2Session(
@@ -204,11 +399,11 @@ export function AuthProvider({ children }) {
         console.warn('Microsoft OAuth2 redirect failed:', err.message);
       }
     }
-    return loginWithOAuthProvider('microsoft', email || 'user@outlook.com', name || 'Microsoft User', planMeta);
+    return { redirected: false, paused: true };
   }
 
   async function loginWithGithub(email = null, name = null, planMeta = {}) {
-    if (hasAppwrite) {
+    if (await isAppwriteActive()) {
       try {
         persistPendingOAuthPlan(planMeta);
         account.createOAuth2Session(
@@ -221,33 +416,33 @@ export function AuthProvider({ children }) {
         console.warn('GitHub OAuth2 redirect failed:', err.message);
       }
     }
-    return loginWithOAuthProvider('github', email || 'user@github.com', name || 'GitHub User', planMeta);
+    return { redirected: false, paused: true };
   }
 
   async function loginWithOAuthProvider(provider = 'google', email, name, planMeta = {}) {
     setLoading(true);
-    const selectedPlan = planMeta?.selectedPlan || (email === 'wa363969@gmail.com' ? 'enterprise' : 'starter');
+    const cleanEmail = (email || `user@${provider}.com`).toLowerCase().trim();
+    const selectedPlan = planMeta?.selectedPlan || (cleanEmail === ADMIN_EMAIL ? 'enterprise' : 'starter');
     const selectedBilling = planMeta?.selectedBilling || 'monthly';
     try {
-      const oauthUser = {
-        $id: `user-${provider}-` + Date.now(),
-        name: name || (email ? email.split('@')[0] : 'User'),
-        email: email || `user@${provider}.com`,
-        labels: email === 'wa363969@gmail.com' ? ['admin'] : ['member'],
-        role: email === 'wa363969@gmail.com' ? 'admin' : 'member',
-        selectedPlan,
-        selectedBilling,
-        avatarUrl: `https://api.dicebear.com/7.x/initials/svg?seed=${encodeURIComponent(name || email || 'NX')}`,
-        provider,
-        prefs: { theme: 'dark' },
-      };
+      const oauthUser = normalizeUserObject(
+        {
+          $id: `user-${provider}-` + Date.now(),
+          name: name || cleanEmail.split('@')[0],
+          email: cleanEmail,
+          selectedPlan,
+          selectedBilling,
+          avatarUrl: `https://api.dicebear.com/7.x/initials/svg?seed=${encodeURIComponent(name || cleanEmail || 'NX')}`,
+          provider,
+        },
+        cleanEmail
+      );
 
-      // Check if 2FA is active on this email
-      const twoFactor = get2FAConfig(email);
+      const twoFactor = get2FAConfig(cleanEmail);
       if (twoFactor && twoFactor.enabled) {
         return {
           requires2FA: true,
-          pendingUser: { ...oauthUser, twoFactorConfig: twoFactor }
+          pendingUser: { ...oauthUser, twoFactorConfig: twoFactor },
         };
       }
 
@@ -261,25 +456,7 @@ export function AuthProvider({ children }) {
   }
 
   async function loginWithAppwriteOAuth() {
-    setLoading(true);
-    try {
-      if (hasAppwrite) {
-        try {
-          await account.deleteSession('current');
-        } catch (e) {
-          // ignore
-        }
-        account.createOAuth2Session(
-          'google',
-          `${window.location.origin}/dashboard`,
-          `${window.location.origin}/login`
-        );
-      }
-    } catch (e) {
-      console.warn('Appwrite Google OAuth2 redirect failed:', e.message);
-    } finally {
-      setLoading(false);
-    }
+    return loginWithGoogle();
   }
 
   async function logout() {
@@ -287,24 +464,92 @@ export function AuthProvider({ children }) {
       if (hasAppwrite) {
         await account.deleteSession('current');
       }
-    } catch (e) {
-      // Ignore
-    }
+    } catch {}
     setUser(null);
     localStorage.removeItem('nexora_user_session');
   }
 
   async function forgotPassword(email) {
-    if (hasAppwrite) {
-      return await account.createRecovery(email, `${window.location.origin}/reset-password`);
+    const cleanEmail = (email || '').toLowerCase().trim();
+    if (!cleanEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) {
+      throw new Error('Please enter a valid email address.');
     }
-    return true;
+
+    if (await isAppwriteActive()) {
+      return await account.createRecovery(cleanEmail, `${window.location.origin}/reset-password`);
+    }
+
+    // Local recovery token when Appwrite is paused/offline
+    const creds = getLocalCredentials();
+    if (!creds[cleanEmail] && cleanEmail !== ADMIN_EMAIL) {
+      throw new Error('No registered account found with this email address.');
+    }
+
+    const userId = creds[cleanEmail]?.$id || 'user-admin-1';
+    const secret = Array.from(crypto.getRandomValues(new Uint8Array(16)))
+      .map(b => b.toString(16).padStart(2, '0'))
+      .join('');
+
+    let tokens = {};
+    try {
+      tokens = JSON.parse(localStorage.getItem(RESET_TOKENS_KEY) || '{}');
+    } catch {}
+
+    tokens[secret] = {
+      userId,
+      email: cleanEmail,
+      expiresAt: Date.now() + 15 * 60 * 1000,
+    };
+    localStorage.setItem(RESET_TOKENS_KEY, JSON.stringify(tokens));
+
+    return {
+      localRecovery: true,
+      resetUrl: `/reset-password?userId=${encodeURIComponent(userId)}&secret=${encodeURIComponent(secret)}`,
+    };
   }
 
-  async function resetPassword(userId, secret, password) {
-    if (hasAppwrite) {
-      return await account.updateRecovery(userId, secret, password);
+  async function resetPassword(userId, secret, newPassword) {
+    if (!newPassword || newPassword.length < 8) {
+      throw new Error('Password must be at least 8 characters long.');
     }
+
+    if (await isAppwriteActive()) {
+      return await account.updateRecovery(userId, secret, newPassword);
+    }
+
+    let tokens = {};
+    try {
+      tokens = JSON.parse(localStorage.getItem(RESET_TOKENS_KEY) || '{}');
+    } catch {}
+
+    const tokenData = tokens[secret];
+    if (!tokenData || tokenData.userId !== userId) {
+      throw new Error('Invalid or expired password recovery link.');
+    }
+    if (Date.now() > tokenData.expiresAt) {
+      delete tokens[secret];
+      localStorage.setItem(RESET_TOKENS_KEY, JSON.stringify(tokens));
+      throw new Error('This password recovery link has expired. Please request a new one.');
+    }
+
+    const cleanEmail = tokenData.email.toLowerCase().trim();
+    const creds = getLocalCredentials();
+    const newHash = await hashPassword(newPassword, cleanEmail);
+
+    creds[cleanEmail] = {
+      ...creds[cleanEmail],
+      $id: tokenData.userId,
+      name: creds[cleanEmail]?.name || (cleanEmail === ADMIN_EMAIL ? 'WA Admin' : cleanEmail.split('@')[0]),
+      email: cleanEmail,
+      role: cleanEmail === ADMIN_EMAIL ? 'admin' : (creds[cleanEmail]?.role || 'member'),
+      labels: cleanEmail === ADMIN_EMAIL ? ['admin'] : (creds[cleanEmail]?.labels || ['member']),
+      passwordHash: newHash,
+      updatedAt: new Date().toISOString(),
+    };
+    saveLocalCredentials(creds);
+
+    delete tokens[secret];
+    localStorage.setItem(RESET_TOKENS_KEY, JSON.stringify(tokens));
     return true;
   }
 
@@ -312,7 +557,7 @@ export function AuthProvider({ children }) {
     if (hasAppwrite) {
       try {
         await account.updateName(name);
-      } catch (e) { /* ignore */ }
+      } catch {}
     }
     const updated = { ...user, name };
     setUser(updated);
@@ -323,7 +568,7 @@ export function AuthProvider({ children }) {
     if (hasAppwrite) {
       try {
         await account.updateEmail(email, password);
-      } catch (e) { /* ignore */ }
+      } catch {}
     }
     const updated = { ...user, email };
     setUser(updated);
@@ -331,9 +576,47 @@ export function AuthProvider({ children }) {
   }
 
   async function updatePassword(oldPassword, newPassword) {
-    if (hasAppwrite) {
-      await account.updatePassword(newPassword, oldPassword);
+    if (!oldPassword) {
+      throw new Error('Please enter your current password.');
     }
+    if (!newPassword || newPassword.length < 8) {
+      throw new Error('New password must be at least 8 characters long.');
+    }
+    if (oldPassword === newPassword) {
+      throw new Error('New password must be different from your current password.');
+    }
+
+    const cleanEmail = (user?.email || '').toLowerCase().trim();
+    if (!cleanEmail) {
+      throw new Error('You must be signed in to update your password.');
+    }
+
+    if (await isAppwriteActive()) {
+      await account.updatePassword(newPassword, oldPassword);
+    } else {
+      const creds = getLocalCredentials();
+      const hasSavedCred = Boolean(creds[cleanEmail]?.passwordHash);
+      if (hasSavedCred || cleanEmail === ADMIN_EMAIL) {
+        const isValidOld = await verifyStoredPassword(cleanEmail, oldPassword);
+        if (!isValidOld) {
+          throw new Error('Current password is incorrect.');
+        }
+      }
+    }
+
+    const creds = getLocalCredentials();
+    const newHash = await hashPassword(newPassword, cleanEmail);
+    creds[cleanEmail] = {
+      ...creds[cleanEmail],
+      $id: user.$id,
+      name: user.name,
+      email: cleanEmail,
+      role: user.role,
+      labels: user.labels,
+      passwordHash: newHash,
+      updatedAt: new Date().toISOString(),
+    };
+    saveLocalCredentials(creds);
     return true;
   }
 
@@ -341,7 +624,7 @@ export function AuthProvider({ children }) {
     if (hasAppwrite) {
       try {
         return avatars.getInitials(name || user?.name || 'U');
-      } catch (e) { /* ignore */ }
+      } catch {}
     }
     return null;
   }

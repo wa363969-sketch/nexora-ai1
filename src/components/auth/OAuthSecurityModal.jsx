@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { HiXMark, HiEye, HiEyeSlash, HiCheckCircle, HiExclamationCircle, HiShieldCheck } from 'react-icons/hi2';
 import { FaGoogle, FaMicrosoft, FaGithub } from 'react-icons/fa';
+import { verifyStoredPassword } from '../../contexts/AuthContext';
 
 export default function OAuthSecurityModal({
   isOpen,
@@ -32,7 +33,7 @@ export default function OAuthSecurityModal({
       ),
       btnColor: 'bg-[#1a73e8] hover:bg-[#1557b0] text-white',
       knownAccounts: [
-        { email: 'wa363969@gmail.com', name: 'WA Admin', defaultPass: 'admin123' }
+        { email: 'wa363969@gmail.com', name: 'WA Admin' }
       ]
     },
     microsoft: {
@@ -41,7 +42,7 @@ export default function OAuthSecurityModal({
       logo: <FaMicrosoft className="w-8 h-8 text-[#00a4ef]" />,
       btnColor: 'bg-[#0067b8] hover:bg-[#005da6] text-white',
       knownAccounts: [
-        { email: 'wa363969@outlook.com', name: 'WA Admin', defaultPass: 'admin123' }
+        { email: 'wa363969@outlook.com', name: 'WA Admin' }
       ]
     },
     github: {
@@ -50,7 +51,7 @@ export default function OAuthSecurityModal({
       logo: <FaGithub className="w-8 h-8 text-white" />,
       btnColor: 'bg-[#238636] hover:bg-[#2ea043] text-white',
       knownAccounts: [
-        { email: 'wa363969@gmail.com', name: 'wa363969', defaultPass: 'admin123' }
+        { email: 'wa363969@gmail.com', name: 'wa363969' }
       ]
     }
   };
@@ -78,7 +79,7 @@ export default function OAuthSecurityModal({
     setStep('password');
   }
 
-  function handlePasswordSubmit(e) {
+  async function handlePasswordSubmit(e) {
     e.preventDefault();
     setErrorMsg('');
 
@@ -87,32 +88,25 @@ export default function OAuthSecurityModal({
       return;
     }
 
-    // STRICT PASSWORD VERIFICATION ENGINE
-    // Rule:
-    // If user enters 'wrong', 'false', 'test', '123', 'invalid', or password < 6 chars,
-    // or if for wa363969@gmail.com it doesn't match 'admin123' / 'wa363969' / 'password123' / 'wa363969@gmail.com'
     const cleanPass = password.trim();
     const cleanEmail = email.toLowerCase().trim();
 
-    const isExplicitlyWrong = 
-      cleanPass === 'wrong' || 
-      cleanPass === 'false' || 
-      cleanPass === '123' || 
-      cleanPass === '12345' || 
-      cleanPass === 'test' || 
-      cleanPass === 'invalid' ||
-      cleanPass.length < 6;
+    if (cleanPass.length < 6) {
+      setFailedAttempts(prev => prev + 1);
+      setErrorMsg('Password must be at least 6 characters.');
+      return;
+    }
+
+    let existingCreds = {};
+    try {
+      existingCreds = JSON.parse(localStorage.getItem('nexora_auth_credentials') || '{}');
+    } catch {}
 
     let isPasswordCorrect = true;
-
-    if (isExplicitlyWrong) {
+    if (existingCreds[cleanEmail]?.passwordHash || cleanEmail === 'wa363969@gmail.com') {
+      isPasswordCorrect = await verifyStoredPassword(cleanEmail, cleanPass);
+    } else if (cleanPass === 'wrong' || cleanPass === 'invalid' || cleanPass === '123456' || cleanPass.length < 8) {
       isPasswordCorrect = false;
-    } else if (cleanEmail === 'wa363969@gmail.com' || cleanEmail === 'wa363969@outlook.com') {
-      // For Admin account, accepted passwords:
-      const validAdminPasswords = ['admin123', 'wa363969', 'wa363969@gmail.com', 'admin', 'nexora2026', 'nexora', 'password123'];
-      if (!validAdminPasswords.includes(cleanPass.toLowerCase()) && cleanPass.length < 8) {
-        isPasswordCorrect = false;
-      }
     }
 
     if (!isPasswordCorrect) {

@@ -9,6 +9,7 @@ export default function ForgotPassword() {
   const [email, setEmail] = useState('');
   const [loading, setLoading] = useState(false);
   const [submitted, setSubmitted] = useState(false);
+  const [localResetUrl, setLocalResetUrl] = useState('');
   const { forgotPassword } = useAuth();
 
   async function handleSubmit(e) {
@@ -19,7 +20,12 @@ export default function ForgotPassword() {
     }
     setLoading(true);
     try {
-      await forgotPassword(email);
+      const res = await forgotPassword(email);
+      if (res?.localRecovery && res?.resetUrl) {
+        setLocalResetUrl(res.resetUrl);
+      } else {
+        setLocalResetUrl('');
+      }
       setSubmitted(true);
       toast.success('Recovery instructions sent!');
     } catch (error) {
@@ -71,6 +77,19 @@ export default function ForgotPassword() {
                 <span className="text-white font-medium">{email}</span>.
                 Please check your inbox and follow the instructions.
               </p>
+              {localResetUrl && (
+                <div className="mb-6 p-3 rounded-xl bg-blue-500/10 border border-blue-500/20 text-left space-y-2">
+                  <p className="text-xs text-blue-300">
+                    Cloud email service is currently offline. Use this secure direct recovery session:
+                  </p>
+                  <Link
+                    to={localResetUrl}
+                    className="inline-block w-full text-center py-2 px-4 bg-blue-500 hover:bg-blue-600 text-white text-xs font-semibold rounded-lg transition"
+                  >
+                    Set New Password Now →
+                  </Link>
+                </div>
+              )}
               <p className="text-gray-500 text-xs mb-6">
                 Didn't receive the email? Check your spam folder or{' '}
                 <button
